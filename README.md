@@ -17,7 +17,6 @@ El sistema:
 
 ## 2️⃣ Arquitectura General
 ```md
-│
 Cliente
 │
 ▼

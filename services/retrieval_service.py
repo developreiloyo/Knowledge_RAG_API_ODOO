@@ -1,18 +1,25 @@
 import os
 import psycopg2
+import math
+import hashlib
 from typing import List, Dict
 from dotenv import load_dotenv
 from openai import OpenAI
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
+# --------------------------------------------------
+# Configuración
+# --------------------------------------------------
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4.1-mini"
 
 load_dotenv()
-
 _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# --------------------------------------------------
+# DB helpers
+# --------------------------------------------------
 def _get_connection():
     conn = psycopg2.connect(
         dbname=os.getenv("POSTGRES_DB"),
@@ -25,6 +32,9 @@ def _get_connection():
     register_vector(conn)
     return conn
 
+# --------------------------------------------------
+# Embedding
+# --------------------------------------------------
 def _embed(text: str) -> Vector:
     response = _client.embeddings.create(
         model=EMBEDDING_MODEL,
@@ -32,21 +42,52 @@ def _embed(text: str) -> Vector:
     )
     return Vector(response.data[0].embedding)
 
+# --------------------------------------------------
+# Deduplicación + reranking
+# --------------------------------------------------
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().split())
+
+def _hash(text: str) -> str:
+    return hashlib.sha1(_normalize(text).encode()).hexdigest()
+
+def _deduplicate(results: List[Dict]) -> List[Dict]:
+    seen = {}
+    for r in results:
+        h = _hash(r["content"])
+        if h not in seen or r["similarity"] > seen[h]["similarity"]:
+            seen[h] = r
+    return list(seen.values())
+
+def _rerank(results: List[Dict], top_k: int) -> List[Dict]:
+    ranked = []
+    for r in results:
+        length_score = math.log(max(len(r["content"]), 50))
+        score = r["similarity"] * length_score
+        ranked.append({**r, "_score": score})
+
+    ranked.sort(key=lambda x: x["_score"], reverse=True)
+    return ranked[:top_k]
+
+# --------------------------------------------------
+# Search (solo retrieval)
+# --------------------------------------------------
 def search(
     query_text: str,
     domain: str,
     module: str | None,
     language: str | None,
-    top_k: int = 5,
-    similarity_threshold: float = 0.35
+    top_k: int,
+    similarity_threshold: float
 ) -> List[Dict]:
 
     query_vector = _embed(query_text)
     conn = _get_connection()
 
+    SQL_LIMIT = max(top_k * 3, 10)
+
     try:
         with conn.cursor() as cur:
-
             sql = """
                 SELECT
                     c.content,
@@ -59,11 +100,7 @@ def search(
                     AND d.domain = %s
             """
 
-            params = [
-                query_vector,
-                EMBEDDING_MODEL,
-                domain,
-            ]
+            params = [query_vector, EMBEDDING_MODEL, domain]
 
             if module:
                 sql += " AND d.module = %s"
@@ -83,22 +120,28 @@ def search(
                 query_vector,
                 similarity_threshold,
                 query_vector,
-                top_k
+                SQL_LIMIT
             ])
 
             cur.execute(sql, params)
             rows = cur.fetchall()
 
-        return [
-            {"content": content, "similarity": float(similarity)}
-            for content, similarity in rows
+        raw_results = [
+            {"content": c, "similarity": float(s)}
+            for c, s in rows
         ]
+
+        deduped = _deduplicate(raw_results)
+        reranked = _rerank(deduped, top_k)
+
+        return reranked
 
     finally:
         conn.close()
 
-
-####
+# --------------------------------------------------
+# Answering con citas numeradas
+# --------------------------------------------------
 def answer_question(
     question: str,
     domain: str,
@@ -107,42 +150,42 @@ def answer_question(
     top_k: int = 5
 ) -> Dict:
 
-    # 🔹 Primer intento (estricto)
     results = search(
-        query_text=question,
-        domain=domain,
-        module=module,
-        language=language,
-        top_k=top_k,
-        similarity_threshold=0.35
+        question, domain, module, language, top_k, similarity_threshold=0.35
     )
     mode = "strict"
 
-    # 🔹 Fallback automático (más flexible)
     if not results:
         results = search(
-            query_text=question,
-            domain=domain,
-            module=module,
-            language=language,
-            top_k=top_k,
-            similarity_threshold=0.25,
-            mode = "fallback"
+            question, domain, module, language, top_k, similarity_threshold=0.25
         )
+        mode = "fallback"
 
-    # 🔹 Guard clause final (muy importante)
     if not results:
         return {
             "answer": "No tengo información suficiente para responder a esa pregunta.",
             "sources": []
         }
 
-    context = "\n".join(f"- {r['content']}" for r in results)
+    # 🔢 Numerar fuentes
+    numbered_results = [
+        {**r, "ref_id": i + 1}
+        for i, r in enumerate(results)
+    ]
+
+    # 📚 Contexto con referencias
+    context = "\n".join(
+        f"[{r['ref_id']}] {r['content']}"
+        for r in numbered_results
+    )
 
     system_prompt = (
         "Eres un asistente experto. "
-        "Responde únicamente usando la información del contexto proporcionado. "
-        "Si la respuesta no está en el contexto, indícalo claramente."
+        "Responde únicamente usando el contexto proporcionado. "
+        "Cada afirmación DEBE incluir una cita en formato [n]. "
+        "No inventes información. "
+        "Si la respuesta no está en el contexto, responde exactamente: "
+        "'No tengo información suficiente para responder a esa pregunta.'"
     )
 
     user_prompt = f"""
@@ -163,21 +206,19 @@ Pregunta:
     )
 
     _log_metrics(
-        question=question,
-        domain=domain,
-        module=module,
-        language=language,
-        mode=mode,
-        results=results
+        question, domain, module, language, mode, numbered_results
     )
-    print("📊 LOGGING METRICS:", mode, len(results))
 
+    print("📊 LOGGING METRICS:", mode, len(numbered_results))
 
     return {
         "answer": response.choices[0].message.content.strip(),
-        "sources": results
+        "sources": numbered_results
     }
 
+# --------------------------------------------------
+# Metrics
+# --------------------------------------------------
 def _log_metrics(
     question: str,
     domain: str,
@@ -214,3 +255,5 @@ def _log_metrics(
             )
     finally:
         conn.close()
+
+
