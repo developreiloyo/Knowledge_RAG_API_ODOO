@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional
+from fastapi import Depends
+from auth import get_api_key
 
 from services.retrieval_service import answer_question
 
@@ -66,24 +68,17 @@ class AskResponse(BaseModel):
 # --------------------------------------------------
 # Endpoint
 # --------------------------------------------------
-@app.post("/ask", response_model=AskResponse)
-def ask(request: AskRequest):
-
-    try:
-        result = answer_question(
-            question=request.question,
-            domain=request.domain,
-            module=request.module,
-            language=request.language,
-            top_k=request.top_k
-        )
-        return result
-
-    except Exception as e:
-        # 🔹 Nunca exponemos errores internos
-        raise HTTPException(
-            status_code=500,
-            detail="Error interno procesando la consulta"
-        )
+@app.post("/ask")
+def ask(
+    request: AskRequest,
+    auth=Depends(get_api_key)
+):
+    return answer_question(
+        question=request.question,
+        domain=request.domain,
+        module=request.module,
+        language=request.language,
+        top_k=request.top_k
+    )
 
 

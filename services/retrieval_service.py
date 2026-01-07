@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import psycopg2.extras
 import math
 import hashlib
 from typing import List, Dict
@@ -33,7 +34,7 @@ def _get_connection():
     return conn
 
 # --------------------------------------------------
-# Embedding
+# Embeddings
 # --------------------------------------------------
 def _embed(text: str) -> Vector:
     response = _client.embeddings.create(
@@ -41,6 +42,69 @@ def _embed(text: str) -> Vector:
         input=text
     )
     return Vector(response.data[0].embedding)
+
+# --------------------------------------------------
+# Cache helpers
+# --------------------------------------------------
+def _cache_key(question, domain, module, language):
+    raw = f"{question}|{domain}|{module}|{language}"
+    return hashlib.sha1(raw.lower().encode()).hexdigest()
+
+def _get_cached_answer(cache_key: str):
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT answer, sources
+                FROM answer_cache
+                WHERE cache_key = %s;
+                """,
+                (cache_key,)
+            )
+            row = cur.fetchone()
+            if row:
+                return {
+                    "answer": row[0],
+                    "sources": row[1],
+                    "cached": True
+                }
+    finally:
+        conn.close()
+    return None
+
+def _save_cache(
+    cache_key: str,
+    question: str,
+    domain: str,
+    module: str | None,
+    language: str,
+    answer: str,
+    sources: List[Dict]
+):
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO answer_cache (
+                    cache_key, question, domain, module, language, answer, sources
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (cache_key) DO NOTHING;
+                """,
+                (
+                    cache_key,
+                    question,
+                    domain,
+                    module,
+                    language,
+                    answer,
+                    psycopg2.extras.Json(sources),
+                )
+            )
+    finally:
+        conn.close()
 
 # --------------------------------------------------
 # Deduplicación + reranking
@@ -140,7 +204,7 @@ def search(
         conn.close()
 
 # --------------------------------------------------
-# Answering con citas numeradas
+# Answering (RAG completo)
 # --------------------------------------------------
 def answer_question(
     question: str,
@@ -150,14 +214,28 @@ def answer_question(
     top_k: int = 5
 ) -> Dict:
 
+    cache_key = _cache_key(question, domain, module, language)
+
+    # ⚡ Cache first
+    cached = _get_cached_answer(cache_key)
+    if cached:
+        print("⚡ CACHE HIT")
+        return cached
+
+    print("🧠 CACHE MISS → RAG")
+
     results = search(
-        question, domain, module, language, top_k, similarity_threshold=0.35
+        question, domain, module, language,
+        top_k=top_k,
+        similarity_threshold=0.35
     )
     mode = "strict"
 
     if not results:
         results = search(
-            question, domain, module, language, top_k, similarity_threshold=0.25
+            question, domain, module, language,
+            top_k=top_k,
+            similarity_threshold=0.25
         )
         mode = "fallback"
 
@@ -167,25 +245,24 @@ def answer_question(
             "sources": []
         }
 
-    # 🔢 Numerar fuentes
-    numbered_results = [
-        {**r, "ref_id": i + 1}
-        for i, r in enumerate(results)
-    ]
+    # 🔢 Numerar citas
+    numbered = []
+    context_lines = []
+    for idx, r in enumerate(results, start=1):
+        numbered.append({
+            "id": idx,
+            "content": r["content"],
+            "similarity": r["similarity"]
+        })
+        context_lines.append(f"[{idx}] {r['content']}")
 
-    # 📚 Contexto con referencias
-    context = "\n".join(
-        f"[{r['ref_id']}] {r['content']}"
-        for r in numbered_results
-    )
+    context = "\n".join(context_lines)
 
     system_prompt = (
         "Eres un asistente experto. "
-        "Responde únicamente usando el contexto proporcionado. "
-        "Cada afirmación DEBE incluir una cita en formato [n]. "
-        "No inventes información. "
-        "Si la respuesta no está en el contexto, responde exactamente: "
-        "'No tengo información suficiente para responder a esa pregunta.'"
+        "Responde usando exclusivamente el contexto proporcionado. "
+        "Incluye referencias numéricas como [1], [2], etc. "
+        "Si la respuesta no está en el contexto, indícalo claramente."
     )
 
     user_prompt = f"""
@@ -205,15 +282,24 @@ Pregunta:
         temperature=0.2,
     )
 
-    _log_metrics(
-        question, domain, module, language, mode, numbered_results
+    answer_text = response.choices[0].message.content.strip()
+
+    _save_cache(
+        cache_key,
+        question,
+        domain,
+        module,
+        language,
+        answer_text,
+        numbered
     )
 
-    print("📊 LOGGING METRICS:", mode, len(numbered_results))
+    _log_metrics(question, domain, module, language, mode, numbered)
 
     return {
-        "answer": response.choices[0].message.content.strip(),
-        "sources": numbered_results
+        "answer": answer_text,
+        "sources": numbered,
+        "cached": False
     }
 
 # --------------------------------------------------
@@ -255,5 +341,4 @@ def _log_metrics(
             )
     finally:
         conn.close()
-
 
