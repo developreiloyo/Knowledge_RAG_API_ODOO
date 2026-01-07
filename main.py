@@ -1,5 +1,5 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional
 
 from services.retrieval_service import answer_question
@@ -9,19 +9,51 @@ from services.retrieval_service import answer_question
 # --------------------------------------------------
 app = FastAPI(
     title="Knowledge Retrieval API",
-    version="1.0.0",
-    description="API RAG para consultas semánticas sobre conocimiento empresarial"
+    version="1.1.0",
 )
+
+# --------------------------------------------------
+# Constantes de validación
+# --------------------------------------------------
+ALLOWED_DOMAINS = {"odoo", "wms", "legal", "finance"}
+ALLOWED_LANGUAGES = {"en", "es", "pt"}
+
+MAX_QUESTION_LENGTH = 500
+MAX_TOP_K = 10
 
 # --------------------------------------------------
 # Schemas
 # --------------------------------------------------
 class AskRequest(BaseModel):
-    question: str
+    question: str = Field(
+        ...,
+        min_length=5,
+        max_length=MAX_QUESTION_LENGTH,
+        description="Pregunta del usuario"
+    )
     domain: str
     module: Optional[str] = None
     language: Optional[str] = "en"
-    top_k: int = 5
+    top_k: int = Field(default=5, ge=1, le=MAX_TOP_K)
+
+    # 🔹 Validadores
+    @validator("domain")
+    def validate_domain(cls, v):
+        if v not in ALLOWED_DOMAINS:
+            raise ValueError(f"Dominio inválido. Permitidos: {ALLOWED_DOMAINS}")
+        return v
+
+    @validator("language")
+    def validate_language(cls, v):
+        if v not in ALLOWED_LANGUAGES:
+            raise ValueError(f"Idioma inválido. Permitidos: {ALLOWED_LANGUAGES}")
+        return v
+
+    @validator("question")
+    def clean_question(cls, v):
+        if v.strip().lower() in {"hi", "hola", "hello", "test"}:
+            raise ValueError("Pregunta demasiado vaga")
+        return v.strip()
 
 class Source(BaseModel):
     content: str
@@ -36,23 +68,22 @@ class AskResponse(BaseModel):
 # --------------------------------------------------
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest):
-    """
-    Endpoint principal de preguntas.
 
-    Flujo:
-    - Valida input
-    - Llama al motor RAG
-    - Devuelve respuesta + fuentes
-    """
+    try:
+        result = answer_question(
+            question=request.question,
+            domain=request.domain,
+            module=request.module,
+            language=request.language,
+            top_k=request.top_k
+        )
+        return result
 
-    result = answer_question(
-        question=request.question,
-        domain=request.domain,
-        module=request.module,
-        language=request.language,
-        top_k=request.top_k
-    )
-
-    return result
+    except Exception as e:
+        # 🔹 Nunca exponemos errores internos
+        raise HTTPException(
+            status_code=500,
+            detail="Error interno procesando la consulta"
+        )
 
 
