@@ -16,7 +16,7 @@ El sistema:
 ---
 
 ## 2️⃣ Arquitectura General
-'''
+│
 Cliente
 │
 ▼
@@ -34,7 +34,7 @@ LLM (OpenAI Chat)
 │
 ▼
 Respuesta final + fuentes
-'''
+
 ---
 
 ## 3️⃣ Tecnologías Utilizadas
